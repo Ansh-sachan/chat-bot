@@ -14,7 +14,7 @@ export class OpenAIResponseHandler {
     constructor(
         private readonly openai : OpenAI,
         private readonly chatClient : StreamChat,
-        private readonly oepnAiThread : OpenAI.Beta.Threads.Thread,
+        private readonly openAiThread : OpenAI.Beta.Threads.Thread,
         private readonly channel : Channel,
         private readonly assistantStream : AssistantStream,
         private readonly message : MessageResponse,
@@ -23,7 +23,83 @@ export class OpenAIResponseHandler {
         this.chatClient.on("ai_indicator.stop", this.handleStopGenerating);
     }
 
-    run = async () => {};
+    run = async () => {
+        const {cid, id} = this.message;
+        let isCompleted = false;
+        let toolOutputs = [];
+        let currentStream : AssistantStream = this.assistantStream;
+
+        try{
+            while(!isCompleted){
+                for await (const event of currentStream) {
+                    this.handleStreamEvent(event);
+                    if(event.event === "thread.run.requires_action" && event.data.required_action?.type === "submit_tool_outputs"){
+                        this.run_id = event.data.id;
+                        await this.channel.sendEvent({
+                            type : "ai_indicator.update",
+                            ai_state : "AI_STATE_External_SOURCES",
+                            cid : cid,
+                            message_id : id,
+                        })
+                        const toolCalls = event.data.required_action.submit_tool_outputs.tool_calls;
+                        toolOutputs = [];
+                        for await(const toolCall of toolCalls){
+                            if(toolCall.function.name === "web_search"){
+                                try {
+                                    const args = JSON.parse(toolCall.function.arguments);
+                                    const searchResults = await this.handleWebSearch(args.query) ;
+                                    toolOutputs.push({
+                                        tool_call_id : toolCall.id,
+                                        output:searchResults ,
+                                    })
+                                } catch (error) {
+                                    console.error(
+                                    "Error parsing tool arguments or performing web search",
+                                    error
+                                    );
+
+                                    toolOutputs.push({
+                                        tool_call_id : toolCall.id,
+                                        output : JSON.stringify({error : "failed to call tool"})
+                                    })
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if(event.event === "thread.run.completed"){
+                        isCompleted = true;
+                        break;
+                    }
+                    if(event.event === "thread.run.failed"){
+                        isCompleted = true;
+                        await this.handleError(
+                         new Error(event.data.last_error?.message ?? "Run failed")
+                        );
+                        break; //exit  
+                    }
+                }
+                if(isCompleted){
+                    break; // exit the while loop
+                }
+        if (toolOutputs.length > 0) {
+          currentStream = this.openai.beta.threads.runs.submitToolOutputsStream(
+            this.openAiThread.id,
+            this.run_id as any,
+            { tool_outputs: toolOutputs }
+          );
+          toolOutputs = []; // Reset tool outputs
+        }
+
+            }
+        }catch(e){
+            console.error("An error occurred while generating response",e);
+            await this.handleError(e as Error);
+        }finally{
+            await this.dispose();
+        }
+
+    };
     dispose = async () => {
         if(this.is_done){
             return
@@ -38,12 +114,12 @@ export class OpenAIResponseHandler {
             return 
         }
         console.log("stopping ai generation",this.message);
-        if(!this.openai || !this.oepnAiThread || !this.run_id){
+        if(!this.openai || !this.openAiThread || !this.run_id){
             return
         }
         
         try {
-           const cancelledRun = await this.openai.beta.threads.runs.cancel(this.oepnAiThread.id, this.run_id as any);
+           const cancelledRun = await this.openai.beta.threads.runs.cancel(this.openAiThread.id, this.run_id as any);
            console.log("Successfully cancelled run:", cancelledRun);
         } catch (error) {
             console.error("Failed to cancel run:", error);
@@ -55,7 +131,47 @@ export class OpenAIResponseHandler {
         })
         await this.dispose();
     };
-    private handleStreamEvent = async (event:Event) => {};
+    private handleStreamEvent = async (event:OpenAI.Beta.Assistants.AssistantStreamEvent) => {
+        const {cid, id} = this.message;
+        if(event.event === "thread.run.created"){
+            this.run_id = event.data.id;
+        } else if(event.event === "thread.message.delta"){
+            const textDelta = event.data.delta.content?.[0];
+            if(textDelta?.type === "text" && textDelta.index){
+                this.message_text += textDelta.text?.value || "";
+                const now = Date.now();
+                if(now - this.last_update_time > 1000){
+                    await this.chatClient.partialUpdateMessage(id,{
+                        set: {
+                            text :  this.message_text
+                        }
+                    })
+                    this.last_update_time = now;
+                }
+                this.chunk_counter += 1;
+            }
+        } else if(event.event === "thread.message.completed"){
+            await this.chatClient.partialUpdateMessage(id, {
+                set : {
+                    text : event.data.content[0]?.type === "text" ? event.data.content[0].text.value : this.message_text
+                }
+            })
+            this.channel.sendEvent({
+                type : "ai_indicator.clear",
+                cid : cid,
+                message_id : id,
+            })
+        } else if(event.event === "thread.run.step.created"){
+            if(event.data.step_details.type === "message_creation"){
+                await this.channel.sendEvent({
+                    type : "ai_indicator.update",
+                    ai_state : "AI_STATE_GENERATING",
+                    cid : cid,
+                    message_id : id,
+                })
+            }
+        }
+    };
     private handleError = async (error:Error) => {
         if(this.is_done){
             return
